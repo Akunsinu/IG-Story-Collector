@@ -524,23 +524,11 @@
           var maxDuration = duration * 1000;
           var startTime = 0;
 
-          function drawFrame() {
-            var elapsed = Date.now() - startTime;
-            var progress = Math.min(elapsed / maxDuration, 1);
-
-            if (video.ended || elapsed >= maxDuration) {
-              if (recorder && recorder.state === 'recording') {
-                recorder.stop();
-              }
-              return;
-            }
-
-            // Clear and draw black background
+          function paintFrame(progress) {
             ctx.fillStyle = '#000000';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // Draw video frame
-            if (video.readyState >= 2) {
+            if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
               var videoAspect = video.videoWidth / video.videoHeight;
               var canvasAspect = canvas.width / canvas.height;
               var drawWidth, drawHeight, drawX, drawY;
@@ -564,14 +552,32 @@
               }
             }
 
-            // Draw UI overlay with progress
             drawUIOverlay(ctx, canvas.width, canvas.height, uiElements, progress);
+          }
 
+          function drawFrame() {
+            var elapsed = Date.now() - startTime;
+            var progress = Math.min(elapsed / maxDuration, 1);
+
+            if (video.ended || elapsed >= maxDuration) {
+              if (recorder && recorder.state === 'recording') {
+                recorder.stop();
+              }
+              return;
+            }
+
+            paintFrame(progress);
             requestAnimationFrame(drawFrame);
           }
 
           function beginRecording() {
             if (startTime !== 0) return;
+
+            // Pre-paint the first decoded frame onto the canvas BEFORE
+            // starting the recorder, so captureStream's initial frame is
+            // the video's first frame instead of an empty/black canvas.
+            paintFrame(0);
+
             startTime = Date.now();
             recorder.start(100);
             drawFrame();
@@ -584,10 +590,14 @@
             }, maxDuration + 3000);
           }
 
-          // Wait for the first decoded frame before starting capture so we
-          // don't record blank canvas at the start. 'playing' fires after
-          // playback actually begins (readyState >= HAVE_FUTURE_DATA).
-          video.addEventListener('playing', beginRecording, { once: true });
+          // Prefer requestVideoFrameCallback: it fires when the first decoded
+          // frame is actually presented, guaranteeing drawImage has real
+          // pixels to copy. Fall back to the 'playing' event otherwise.
+          if (typeof video.requestVideoFrameCallback === 'function') {
+            video.requestVideoFrameCallback(beginRecording);
+          } else {
+            video.addEventListener('playing', beginRecording, { once: true });
+          }
 
           video.play().catch(function(err) {
             console.error('[Story POC] video.play() failed:', err);
