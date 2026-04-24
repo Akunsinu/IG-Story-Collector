@@ -1,60 +1,51 @@
 /**
  * Background Service Worker
- * Handles CSP bypass for script injection
+ * - Installs a declarativeNetRequest rule so cross-origin media fetches from
+ *   *.cdninstagram.com aren't blocked by CSP when we pull them into a canvas.
+ * - Relays download requests from the bridge to chrome.downloads.
  */
 
-// Remove Content-Security-Policy headers to allow our scripts to run
-chrome.declarativeNetRequest.updateDynamicRules({
-  removeRuleIds: [1, 2],
-  addRules: [
-    {
-      id: 1,
-      priority: 1,
-      action: {
-        type: 'modifyHeaders',
-        responseHeaders: [
-          { header: 'Content-Security-Policy', operation: 'remove' },
-          { header: 'Content-Security-Policy-Report-Only', operation: 'remove' }
-        ]
-      },
-      condition: {
-        urlFilter: '*://www.instagram.com/*',
-        resourceTypes: ['main_frame', 'sub_frame']
+function installRules() {
+  chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [1, 2],
+    addRules: [
+      {
+        id: 1,
+        priority: 1,
+        action: {
+          type: 'modifyHeaders',
+          responseHeaders: [
+            { header: 'Content-Security-Policy', operation: 'remove' }
+          ]
+        },
+        condition: {
+          urlFilter: '*://*.cdninstagram.com/*',
+          resourceTypes: ['xmlhttprequest', 'media', 'image']
+        }
       }
-    },
-    {
-      id: 2,
-      priority: 1,
-      action: {
-        type: 'modifyHeaders',
-        responseHeaders: [
-          { header: 'Content-Security-Policy', operation: 'remove' }
-        ]
-      },
-      condition: {
-        urlFilter: '*://*.cdninstagram.com/*',
-        resourceTypes: ['xmlhttprequest', 'media', 'image']
-      }
-    }
-  ]
-}).then(() => {
-  console.log('[Story POC] CSP rules installed');
-}).catch(err => {
-  console.error('[Story POC] Failed to install CSP rules:', err);
-});
+    ]
+  }).then(function() {
+    console.log('[Story POC] CSP rules installed');
+  }).catch(function(err) {
+    console.error('[Story POC] Failed to install CSP rules:', err);
+  });
+}
 
-// Listen for messages from content script (for future expansion)
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'download') {
-    chrome.downloads.download({
-      url: message.url,
-      filename: message.filename,
-      saveAs: false
-    }, (downloadId) => {
-      sendResponse({ success: true, downloadId });
-    });
-    return true;
-  }
+chrome.runtime.onInstalled.addListener(installRules);
+chrome.runtime.onStartup.addListener(installRules);
+
+chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
+  if (message.action !== 'download') return;
+
+  chrome.downloads.download({
+    url: message.url,
+    filename: message.filename,
+    saveAs: false
+  }, function(downloadId) {
+    var err = chrome.runtime.lastError;
+    sendResponse({ success: !err && downloadId != null, downloadId: downloadId });
+  });
+  return true;
 });
 
 console.log('[Story POC] Background worker ready');

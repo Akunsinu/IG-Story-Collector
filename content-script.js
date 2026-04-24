@@ -9,43 +9,16 @@
   if (window.__storyDownloaderPOC) return;
   window.__storyDownloaderPOC = true;
 
-  // Storage for captured story data
+  // Storage for captured story data, keyed by username: { [username]: { [storyId]: data } }
   window.__capturedStories = {};
+
+  // Pending raw download promises, keyed by filename
+  var pendingDownloads = {};
 
   console.log('[Story POC] Initializing...');
 
   // ============================================================
-  // TECHNIQUE 1: Load html2canvas for UI capture
-  // ============================================================
-
-  var html2canvasLoaded = false;
-
-  function loadHtml2Canvas() {
-    return new Promise(function(resolve) {
-      if (window.html2canvas) {
-        html2canvasLoaded = true;
-        resolve();
-        return;
-      }
-
-      // Request html2canvas from bridge script
-      window.postMessage({ type: 'STORY_POC_LOAD_HTML2CANVAS' }, '*');
-
-      // Check periodically if it's loaded
-      var checkCount = 0;
-      var checkInterval = setInterval(function() {
-        if (window.html2canvas || checkCount > 50) {
-          clearInterval(checkInterval);
-          html2canvasLoaded = !!window.html2canvas;
-          resolve();
-        }
-        checkCount++;
-      }, 100);
-    });
-  }
-
-  // ============================================================
-  // TECHNIQUE 2: Intercept fetch for story data
+  // TECHNIQUE 1: Intercept fetch for story data
   // ============================================================
 
   var originalFetch = window.fetch;
@@ -72,7 +45,7 @@
   };
 
   // ============================================================
-  // TECHNIQUE 3: Intercept XHR for story data
+  // TECHNIQUE 2: Intercept XHR for story data
   // ============================================================
 
   var originalXHROpen = XMLHttpRequest.prototype.open;
@@ -105,7 +78,7 @@
   };
 
   // ============================================================
-  // TECHNIQUE 4: Extract story URLs from API responses
+  // TECHNIQUE 3: Extract story URLs from API responses
   // ============================================================
 
   function extractStoriesFromResponse(data, depth) {
@@ -161,7 +134,7 @@
                    (user && user.username) ||
                    extractUsernameFromURL();
 
-    if (window.__capturedStories[storyId]) return;
+    if (window.__capturedStories[username] && window.__capturedStories[username][storyId]) return;
 
     // Get profile picture URL
     var profilePicUrl = null;
@@ -196,7 +169,8 @@
     }
 
     if (storyData.videoUrl || storyData.imageUrl) {
-      window.__capturedStories[storyId] = storyData;
+      if (!window.__capturedStories[username]) window.__capturedStories[username] = {};
+      window.__capturedStories[username][storyId] = storyData;
       console.log('[Story POC] Captured:', username, storyId, storyData.mediaType === 2 ? 'video' : 'image');
       updateButtonBadge();
     }
@@ -208,33 +182,8 @@
   }
 
   // ============================================================
-  // TECHNIQUE 5: UI Capture Functions
+  // TECHNIQUE 4: UI Capture Functions
   // ============================================================
-
-  function findStoryContainer() {
-    // Try different selectors for the story viewer
-    var selectors = [
-      'section[role="dialog"] > div > div > div',
-      'div[role="dialog"] section',
-      'section > div > div > div > div > div'
-    ];
-
-    for (var i = 0; i < selectors.length; i++) {
-      var el = document.querySelector(selectors[i]);
-      if (el && el.querySelector('video, img')) {
-        return el;
-      }
-    }
-
-    // Fallback: find the main story area
-    var videos = document.querySelectorAll('video');
-    for (var j = 0; j < videos.length; j++) {
-      var parent = videos[j].closest('section') || videos[j].parentElement.parentElement.parentElement;
-      if (parent) return parent;
-    }
-
-    return null;
-  }
 
   function captureScreenshotWithUI(story) {
     return new Promise(function(resolve, reject) {
@@ -440,6 +389,11 @@
       video.muted = false; // Keep audio enabled
       video.playsInline = true;
       video.volume = 1.0;
+      // Attach off-screen. Chrome may skip decoding frames for detached
+      // <video> elements, which produces a recording with audio but a
+      // completely black picture when we drawImage() it to the canvas.
+      video.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;';
+      document.body.appendChild(video);
 
       // Create canvas for compositing
       var canvas = document.createElement('canvas');
@@ -523,6 +477,7 @@
             console.log('[Story POC] Recording complete, size:', blob.size, 'type:', outputType);
             video.pause();
             video.src = '';
+            if (video.parentNode) video.parentNode.removeChild(video);
             // Clean up audio context
             if (audioContext) {
               audioContext.close().catch(function() {});
@@ -530,13 +485,9 @@
             resolve({ blob: blob, isMP4: outputType === 'video/mp4' });
           };
 
-          // Start recording and playing
-          recorder.start(100);
-          video.play();
-
           var duration = story.videoDuration || video.duration || 15;
-          var startTime = Date.now();
           var maxDuration = duration * 1000;
+          var startTime = 0;
 
           function drawFrame() {
             var elapsed = Date.now() - startTime;
@@ -584,19 +535,34 @@
             requestAnimationFrame(drawFrame);
           }
 
-          drawFrame();
+          function beginRecording() {
+            if (startTime !== 0) return;
+            startTime = Date.now();
+            recorder.start(100);
+            drawFrame();
 
-          // Safety timeout
-          setTimeout(function() {
-            if (recorder && recorder.state === 'recording') {
-              recorder.stop();
-            }
-          }, maxDuration + 3000);
+            // Safety timeout
+            setTimeout(function() {
+              if (recorder && recorder.state === 'recording') {
+                recorder.stop();
+              }
+            }, maxDuration + 3000);
+          }
+
+          // Wait for the first decoded frame before starting capture so we
+          // don't record blank canvas at the start. 'playing' fires after
+          // playback actually begins (readyState >= HAVE_FUTURE_DATA).
+          video.addEventListener('playing', beginRecording, { once: true });
+
+          video.play().catch(function(err) {
+            console.error('[Story POC] video.play() failed:', err);
+          });
         });
       };
 
       video.onerror = function(e) {
         console.error('[Story POC] Video load error:', e);
+        if (video.parentNode) video.parentNode.removeChild(video);
         reject(new Error('Failed to load video'));
       };
 
@@ -615,38 +581,6 @@
     if (diff < 3600) return Math.floor(diff / 60) + 'm';
     if (diff < 86400) return Math.floor(diff / 3600) + 'h';
     return Math.floor(diff / 86400) + 'd';
-  }
-
-  function captureUIElements(container) {
-    var ui = {
-      username: '',
-      timestamp: '',
-      profilePic: null
-    };
-
-    if (!container) return ui;
-
-    // Try to find username
-    var usernameEl = container.querySelector('a[href*="/"] span') ||
-                     container.querySelector('header span');
-    if (usernameEl) {
-      ui.username = usernameEl.textContent || '';
-    }
-
-    // Try to find timestamp
-    var timeEl = container.querySelector('time') ||
-                 container.querySelector('header span:last-child');
-    if (timeEl) {
-      ui.timestamp = timeEl.textContent || '';
-    }
-
-    // Try to find profile picture
-    var profileImg = container.querySelector('header img');
-    if (profileImg && profileImg.src) {
-      ui.profilePic = profileImg.src;
-    }
-
-    return ui;
   }
 
   function drawUIOverlay(ctx, width, height, ui, progress) {
@@ -875,7 +809,7 @@
   }
 
   // ============================================================
-  // TECHNIQUE 6: Download button with badge
+  // TECHNIQUE 5: Download button with badge
   // ============================================================
 
   function createDownloadButton() {
@@ -906,13 +840,14 @@
   function updateButtonBadge() {
     var badge = document.getElementById('story-poc-badge');
     if (badge) {
-      var count = Object.keys(window.__capturedStories).length;
-      badge.textContent = String(count);
+      var username = extractUsernameFromURL();
+      var userStories = window.__capturedStories[username] || {};
+      badge.textContent = String(Object.keys(userStories).length);
     }
   }
 
   // ============================================================
-  // TECHNIQUE 7: Download modal with format options
+  // TECHNIQUE 6: Download modal with format options
   // ============================================================
 
   function showDownloadModal() {
@@ -920,10 +855,7 @@
     if (existing) existing.remove();
 
     var username = extractUsernameFromURL();
-    var allStories = Object.values(window.__capturedStories);
-    var stories = allStories.filter(function(s) {
-      return s.username === username || username === 'unknown' || allStories.length < 20;
-    });
+    var stories = Object.values(window.__capturedStories[username] || {});
 
     if (stories.length === 0) {
       alert('No stories captured yet. The extension captures story data as Instagram loads it.\n\nTry:\n1. Refresh the page\n2. Click through some stories\n3. Check again');
@@ -1071,8 +1003,19 @@
   }
 
   // ============================================================
-  // TECHNIQUE 8: Download functions
+  // TECHNIQUE 7: Download functions
   // ============================================================
+
+  // Listen for download completion acknowledgements from the bridge
+  window.addEventListener('message', function(event) {
+    if (event.source !== window) return;
+    if (!event.data || event.data.type !== 'STORY_POC_DOWNLOAD_RESPONSE') return;
+    var resolver = pendingDownloads[event.data.filename];
+    if (resolver) {
+      delete pendingDownloads[event.data.filename];
+      resolver(event.data.success);
+    }
+  });
 
   function generateFilename(story, suffix, ext) {
     var date = new Date(story.takenAt * 1000);
@@ -1125,12 +1068,19 @@
       console.log('[Story POC] Downloading raw:', rawFilename);
 
       promises.push(new Promise(function(resolve) {
+        pendingDownloads[rawFilename] = resolve;
         window.postMessage({
           type: 'STORY_POC_DOWNLOAD',
           url: rawUrl,
           filename: rawFilename
         }, '*');
-        setTimeout(resolve, 100);
+        // Safety timeout in case the acknowledgement is lost
+        setTimeout(function() {
+          if (pendingDownloads[rawFilename]) {
+            delete pendingDownloads[rawFilename];
+            resolve(false);
+          }
+        }, 30000);
       }));
     }
 
@@ -1210,7 +1160,7 @@
   }
 
   // ============================================================
-  // TECHNIQUE 9: Watch for story page navigation
+  // TECHNIQUE 8: Watch for story page navigation
   // ============================================================
 
   function checkAndAddButton() {
@@ -1242,9 +1192,6 @@
       setTimeout(checkAndAddButton, 500);
     }
   }).observe(document, { subtree: true, childList: true });
-
-  // Periodic check
-  setInterval(checkAndAddButton, 2000);
 
   console.log('[Story POC] Ready! Navigate to a story page to see the download button.');
 
