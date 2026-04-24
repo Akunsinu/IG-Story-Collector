@@ -24,15 +24,16 @@
   // Story-bearing endpoints. Bare /api/v1/feed/user/<id>/ is the profile
   // grid feed (regular posts) and must NOT match — we only want the
   // story-specific subpaths (/story/, /reel_media/) and the story tray.
-  // GraphQL is broad; the per-item discriminator in processStoryItem is
-  // the real safety net.
-  var STORY_USER_RE = /\/api\/v1\/feed\/user\/\d+\/(story|reel_media)\b/;
+  // GraphQL is broad and IG uses both /api/graphql/ and /graphql/query/;
+  // we match on the substring and let the per-item filter in
+  // processStoryItem reject anything that's clearly a feed post.
+  var STORY_USER_RE = /\/feed\/user\/[^\/]+\/(story|reel_media)\b/;
 
   function isStoryEndpoint(urlStr) {
     if (!urlStr) return false;
-    if (urlStr.indexOf('api/v1/feed/reels_media') !== -1) return true;
+    if (urlStr.indexOf('feed/reels_media') !== -1) return true;
     if (STORY_USER_RE.test(urlStr)) return true;
-    if (urlStr.indexOf('/api/graphql') !== -1) return true;
+    if (urlStr.indexOf('graphql') !== -1) return true;
     return false;
   }
 
@@ -135,13 +136,16 @@
     var storyId = item.id || item.pk;
     if (!storyId) return;
 
-    // Story discriminator: stories carry at least one of these markers.
-    // Regular feed posts have like_count/comment_count and no expiring_at,
-    // so they fail every branch and get rejected here.
-    var isStory = !!item.expiring_at ||
-                  item.is_reel_media === true ||
-                  item.product_type === 'story';
-    if (!isStory) return;
+    // Reject items that are clearly regular feed posts: they carry
+    // like_count/comment_count and lack any story marker. A positive-only
+    // filter (require expiring_at etc.) is too strict — Polaris GraphQL
+    // sometimes serves stories without the field shapes we'd expect.
+    var hasFeedMarkers = typeof item.like_count === 'number' ||
+                         typeof item.comment_count === 'number';
+    var hasStoryMarkers = !!item.expiring_at ||
+                          item.is_reel_media === true ||
+                          item.product_type === 'story';
+    if (hasFeedMarkers && !hasStoryMarkers) return;
 
     var username = (item.user && item.user.username) ||
                    (user && user.username) ||
