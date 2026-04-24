@@ -4,7 +4,6 @@
   "description": "Download Instagram stories without viewing them",
   "version": "1.1.0",
   "permissions": [
-    "scripting",
     "storage",
     "downloads",
     "declarativeNetRequest"
@@ -34,7 +33,7 @@
   "web_accessible_resources": [
     {
       "matches": ["https://www.instagram.com/*"],
-      "resources": ["styles.css", "html2canvas.min.js"]
+      "resources": ["styles.css"]
     }
   ],
   "icons": {

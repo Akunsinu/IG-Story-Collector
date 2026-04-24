@@ -9,44 +9,32 @@
   if (window.__storyDownloaderPOC) return;
   window.__storyDownloaderPOC = true;
 
-  // Storage for captured story data
+  // Storage for captured story data, keyed by storyId
   window.__capturedStories = {};
+
+  // Pending raw-download promises, keyed by filename
+  var pendingDownloads = {};
 
   console.log('[Story POC] Initializing...');
 
   // ============================================================
-  // TECHNIQUE 1: Load html2canvas for UI capture
+  // TECHNIQUE 1: Intercept fetch / XHR for story data
   // ============================================================
 
-  var html2canvasLoaded = false;
+  // Story-bearing endpoints. Bare /api/v1/feed/user/<id>/ is the profile
+  // grid feed (regular posts) and must NOT match — we only want the
+  // story-specific subpaths (/story/, /reel_media/) and the story tray.
+  // GraphQL is broad; the per-item discriminator in processStoryItem is
+  // the real safety net.
+  var STORY_USER_RE = /\/api\/v1\/feed\/user\/\d+\/(story|reel_media)\b/;
 
-  function loadHtml2Canvas() {
-    return new Promise(function(resolve) {
-      if (window.html2canvas) {
-        html2canvasLoaded = true;
-        resolve();
-        return;
-      }
-
-      // Request html2canvas from bridge script
-      window.postMessage({ type: 'STORY_POC_LOAD_HTML2CANVAS' }, '*');
-
-      // Check periodically if it's loaded
-      var checkCount = 0;
-      var checkInterval = setInterval(function() {
-        if (window.html2canvas || checkCount > 50) {
-          clearInterval(checkInterval);
-          html2canvasLoaded = !!window.html2canvas;
-          resolve();
-        }
-        checkCount++;
-      }, 100);
-    });
+  function isStoryEndpoint(urlStr) {
+    if (!urlStr) return false;
+    if (urlStr.indexOf('api/v1/feed/reels_media') !== -1) return true;
+    if (STORY_USER_RE.test(urlStr)) return true;
+    if (urlStr.indexOf('/api/graphql') !== -1) return true;
+    return false;
   }
-
-  // ============================================================
-  // TECHNIQUE 2: Intercept fetch for story data
-  // ============================================================
 
   var originalFetch = window.fetch;
   window.fetch = async function(url, options) {
@@ -54,10 +42,7 @@
 
     try {
       var urlStr = typeof url === 'string' ? url : url.toString();
-
-      if (urlStr.indexOf('graphql') !== -1 ||
-          urlStr.indexOf('api/v1/feed/reels_media') !== -1 ||
-          urlStr.indexOf('api/v1/feed/user') !== -1) {
+      if (isStoryEndpoint(urlStr)) {
         var clone = response.clone();
         clone.text().then(function(text) {
           try {
@@ -71,10 +56,6 @@
     return response;
   };
 
-  // ============================================================
-  // TECHNIQUE 3: Intercept XHR for story data
-  // ============================================================
-
   var originalXHROpen = XMLHttpRequest.prototype.open;
   var originalXHRSend = XMLHttpRequest.prototype.send;
 
@@ -87,10 +68,7 @@
     var xhr = this;
     var url = this._storyPocUrl || '';
 
-    if (url.indexOf('graphql') !== -1 ||
-        url.indexOf('api/v1/feed/reels_media') !== -1 ||
-        url.indexOf('api/v1/feed/user') !== -1) {
-
+    if (isStoryEndpoint(url)) {
       this.addEventListener('load', function() {
         try {
           if (xhr.responseText) {
@@ -105,7 +83,7 @@
   };
 
   // ============================================================
-  // TECHNIQUE 4: Extract story URLs from API responses
+  // TECHNIQUE 2: Extract story URLs from API responses
   // ============================================================
 
   function extractStoriesFromResponse(data, depth) {
@@ -156,6 +134,14 @@
 
     var storyId = item.id || item.pk;
     if (!storyId) return;
+
+    // Story discriminator: stories carry at least one of these markers.
+    // Regular feed posts have like_count/comment_count and no expiring_at,
+    // so they fail every branch and get rejected here.
+    var isStory = !!item.expiring_at ||
+                  item.is_reel_media === true ||
+                  item.product_type === 'story';
+    if (!isStory) return;
 
     var username = (item.user && item.user.username) ||
                    (user && user.username) ||
@@ -208,33 +194,8 @@
   }
 
   // ============================================================
-  // TECHNIQUE 5: UI Capture Functions
+  // TECHNIQUE 3: UI Capture Functions
   // ============================================================
-
-  function findStoryContainer() {
-    // Try different selectors for the story viewer
-    var selectors = [
-      'section[role="dialog"] > div > div > div',
-      'div[role="dialog"] section',
-      'section > div > div > div > div > div'
-    ];
-
-    for (var i = 0; i < selectors.length; i++) {
-      var el = document.querySelector(selectors[i]);
-      if (el && el.querySelector('video, img')) {
-        return el;
-      }
-    }
-
-    // Fallback: find the main story area
-    var videos = document.querySelectorAll('video');
-    for (var j = 0; j < videos.length; j++) {
-      var parent = videos[j].closest('section') || videos[j].parentElement.parentElement.parentElement;
-      if (parent) return parent;
-    }
-
-    return null;
-  }
 
   function captureScreenshotWithUI(story) {
     return new Promise(function(resolve, reject) {
@@ -440,6 +401,11 @@
       video.muted = false; // Keep audio enabled
       video.playsInline = true;
       video.volume = 1.0;
+      // Attach off-screen. Chrome may skip decoding frames for detached
+      // <video> elements, which produces a recording with audio but a
+      // completely black picture when we drawImage() it onto the canvas.
+      video.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;';
+      document.body.appendChild(video);
 
       // Create canvas for compositing
       var canvas = document.createElement('canvas');
@@ -469,15 +435,16 @@
             combinedStream.addTrack(track);
           });
 
-          // Capture audio from video element
+          // Capture audio from video element. Route only into the
+          // recording stream — do NOT also connect to audioContext.destination,
+          // which would blast the audio through the user's speakers during
+          // every download in a "Download All" run.
           try {
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
             var source = audioContext.createMediaElementSource(video);
             var destination = audioContext.createMediaStreamDestination();
             source.connect(destination);
-            source.connect(audioContext.destination); // Also play through speakers
 
-            // Add audio tracks to combined stream
             destination.stream.getAudioTracks().forEach(function(track) {
               combinedStream.addTrack(track);
               console.log('[Story POC] Audio track added');
@@ -523,6 +490,7 @@
             console.log('[Story POC] Recording complete, size:', blob.size, 'type:', outputType);
             video.pause();
             video.src = '';
+            if (video.parentNode) video.parentNode.removeChild(video);
             // Clean up audio context
             if (audioContext) {
               audioContext.close().catch(function() {});
@@ -530,13 +498,9 @@
             resolve({ blob: blob, isMP4: outputType === 'video/mp4' });
           };
 
-          // Start recording and playing
-          recorder.start(100);
-          video.play();
-
           var duration = story.videoDuration || video.duration || 15;
-          var startTime = Date.now();
           var maxDuration = duration * 1000;
+          var startTime = 0;
 
           function drawFrame() {
             var elapsed = Date.now() - startTime;
@@ -584,19 +548,34 @@
             requestAnimationFrame(drawFrame);
           }
 
-          drawFrame();
+          function beginRecording() {
+            if (startTime !== 0) return;
+            startTime = Date.now();
+            recorder.start(100);
+            drawFrame();
 
-          // Safety timeout
-          setTimeout(function() {
-            if (recorder && recorder.state === 'recording') {
-              recorder.stop();
-            }
-          }, maxDuration + 3000);
+            // Safety timeout
+            setTimeout(function() {
+              if (recorder && recorder.state === 'recording') {
+                recorder.stop();
+              }
+            }, maxDuration + 3000);
+          }
+
+          // Wait for the first decoded frame before starting capture so we
+          // don't record blank canvas at the start. 'playing' fires after
+          // playback actually begins (readyState >= HAVE_FUTURE_DATA).
+          video.addEventListener('playing', beginRecording, { once: true });
+
+          video.play().catch(function(err) {
+            console.error('[Story POC] video.play() failed:', err);
+          });
         });
       };
 
       video.onerror = function(e) {
         console.error('[Story POC] Video load error:', e);
+        if (video.parentNode) video.parentNode.removeChild(video);
         reject(new Error('Failed to load video'));
       };
 
@@ -615,38 +594,6 @@
     if (diff < 3600) return Math.floor(diff / 60) + 'm';
     if (diff < 86400) return Math.floor(diff / 3600) + 'h';
     return Math.floor(diff / 86400) + 'd';
-  }
-
-  function captureUIElements(container) {
-    var ui = {
-      username: '',
-      timestamp: '',
-      profilePic: null
-    };
-
-    if (!container) return ui;
-
-    // Try to find username
-    var usernameEl = container.querySelector('a[href*="/"] span') ||
-                     container.querySelector('header span');
-    if (usernameEl) {
-      ui.username = usernameEl.textContent || '';
-    }
-
-    // Try to find timestamp
-    var timeEl = container.querySelector('time') ||
-                 container.querySelector('header span:last-child');
-    if (timeEl) {
-      ui.timestamp = timeEl.textContent || '';
-    }
-
-    // Try to find profile picture
-    var profileImg = container.querySelector('header img');
-    if (profileImg && profileImg.src) {
-      ui.profilePic = profileImg.src;
-    }
-
-    return ui;
   }
 
   function drawUIOverlay(ctx, width, height, ui, progress) {
@@ -875,7 +822,7 @@
   }
 
   // ============================================================
-  // TECHNIQUE 6: Download button with badge
+  // TECHNIQUE 4: Download button with badge
   // ============================================================
 
   function createDownloadButton() {
@@ -912,7 +859,7 @@
   }
 
   // ============================================================
-  // TECHNIQUE 7: Download modal with format options
+  // TECHNIQUE 5: Download modal with format options
   // ============================================================
 
   function showDownloadModal() {
@@ -920,9 +867,8 @@
     if (existing) existing.remove();
 
     var username = extractUsernameFromURL();
-    var allStories = Object.values(window.__capturedStories);
-    var stories = allStories.filter(function(s) {
-      return s.username === username || username === 'unknown' || allStories.length < 20;
+    var stories = Object.values(window.__capturedStories).filter(function(s) {
+      return s.username === username;
     });
 
     if (stories.length === 0) {
@@ -1071,8 +1017,20 @@
   }
 
   // ============================================================
-  // TECHNIQUE 8: Download functions
+  // TECHNIQUE 6: Download functions
   // ============================================================
+
+  // Listen for download completion acks from the bridge so the raw-download
+  // promise resolves only when chrome.downloads has actually started the file.
+  window.addEventListener('message', function(event) {
+    if (event.source !== window) return;
+    if (!event.data || event.data.type !== 'STORY_POC_DOWNLOAD_RESPONSE') return;
+    var resolver = pendingDownloads[event.data.filename];
+    if (resolver) {
+      delete pendingDownloads[event.data.filename];
+      resolver(event.data.success);
+    }
+  });
 
   function generateFilename(story, suffix, ext) {
     var date = new Date(story.takenAt * 1000);
@@ -1125,12 +1083,19 @@
       console.log('[Story POC] Downloading raw:', rawFilename);
 
       promises.push(new Promise(function(resolve) {
+        pendingDownloads[rawFilename] = resolve;
         window.postMessage({
           type: 'STORY_POC_DOWNLOAD',
           url: rawUrl,
           filename: rawFilename
         }, '*');
-        setTimeout(resolve, 100);
+        // Safety timeout in case the bridge ack never arrives
+        setTimeout(function() {
+          if (pendingDownloads[rawFilename]) {
+            delete pendingDownloads[rawFilename];
+            resolve(false);
+          }
+        }, 30000);
       }));
     }
 
@@ -1210,7 +1175,7 @@
   }
 
   // ============================================================
-  // TECHNIQUE 9: Watch for story page navigation
+  // TECHNIQUE 7: Watch for story page navigation
   // ============================================================
 
   function checkAndAddButton() {
@@ -1242,9 +1207,6 @@
       setTimeout(checkAndAddButton, 500);
     }
   }).observe(document, { subtree: true, childList: true });
-
-  // Periodic check
-  setInterval(checkAndAddButton, 2000);
 
   console.log('[Story POC] Ready! Navigate to a story page to see the download button.');
 
