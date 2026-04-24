@@ -44,15 +44,22 @@
     try {
       var urlStr = typeof url === 'string' ? url : url.toString();
       if (isStoryEndpoint(urlStr)) {
+        console.log('[Story POC] intercepted fetch:', urlStr);
         var clone = response.clone();
         clone.text().then(function(text) {
           try {
             var data = JSON.parse(text);
             extractStoriesFromResponse(data);
-          } catch(e) {}
-        }).catch(function() {});
+          } catch(e) {
+            console.warn('[Story POC] JSON parse failed for', urlStr, e.message);
+          }
+        }).catch(function(e) {
+          console.warn('[Story POC] response.text() failed for', urlStr, e && e.message);
+        });
       }
-    } catch(e) {}
+    } catch(e) {
+      console.warn('[Story POC] fetch wrapper threw:', e && e.message);
+    }
 
     return response;
   };
@@ -70,13 +77,16 @@
     var url = this._storyPocUrl || '';
 
     if (isStoryEndpoint(url)) {
+      console.log('[Story POC] intercepted XHR:', url);
       this.addEventListener('load', function() {
         try {
           if (xhr.responseText) {
             var data = JSON.parse(xhr.responseText);
             extractStoriesFromResponse(data);
           }
-        } catch(e) {}
+        } catch(e) {
+          console.warn('[Story POC] XHR JSON parse failed for', url, e.message);
+        }
       });
     }
 
@@ -88,7 +98,12 @@
   // ============================================================
 
   function extractStoriesFromResponse(data, depth) {
-    if (depth === undefined) depth = 0;
+    if (depth === undefined) {
+      depth = 0;
+      if (data && typeof data === 'object' && !Array.isArray(data)) {
+        console.log('[Story POC] response top-level keys:', Object.keys(data).slice(0, 20));
+      }
+    }
     if (depth > 20 || !data) return;
 
     if (Array.isArray(data)) {
@@ -145,7 +160,10 @@
     var hasStoryMarkers = !!item.expiring_at ||
                           item.is_reel_media === true ||
                           item.product_type === 'story';
-    if (hasFeedMarkers && !hasStoryMarkers) return;
+    if (hasFeedMarkers && !hasStoryMarkers) {
+      console.log('[Story POC] rejected (looks like feed post):', storyId);
+      return;
+    }
 
     var username = (item.user && item.user.username) ||
                    (user && user.username) ||
