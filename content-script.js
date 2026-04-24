@@ -130,11 +130,18 @@
     var storyId = item.id || item.pk;
     if (!storyId) return;
 
+    // Global dedup: extractStoriesFromResponse walks every reel both via
+    // the known reels_media shape AND via the generic recursive descent.
+    // The second pass loses reel.user context and falls back to the URL
+    // username, which would otherwise re-store another user's story under
+    // the currently-viewed user's bucket.
+    for (var existingUser in window.__capturedStories) {
+      if (window.__capturedStories[existingUser][storyId]) return;
+    }
+
     var username = (item.user && item.user.username) ||
                    (user && user.username) ||
                    extractUsernameFromURL();
-
-    if (window.__capturedStories[username] && window.__capturedStories[username][storyId]) return;
 
     // Get profile picture URL
     var profilePicUrl = null;
