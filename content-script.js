@@ -1,5 +1,5 @@
 /**
- * IG-Story-Quicksave v1.1
+ * IG-Story-Quicksave v1.2.0
  * Downloads Instagram stories as raw files or with UI overlay
  */
 
